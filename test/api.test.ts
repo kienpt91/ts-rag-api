@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { buildApp } from "../src/app.js";
+import { buildApp, type AppOptions } from "../src/app.js";
 import { UpstreamError, type AnswerGenerator } from "../src/types.js";
 import { createTestService } from "./helpers/fixtures.js";
 
@@ -9,9 +9,10 @@ afterEach(async () => {
   await app.close();
 });
 
-function start(options: { bodyLimit?: number; generator?: AnswerGenerator } = {}) {
-  const { service, store } = createTestService(options.generator ? { generator: options.generator } : {});
-  app = buildApp({ service, healthCheck: () => store.count(), ...(options.bodyLimit ? { bodyLimit: options.bodyLimit } : {}) });
+function start(options: { bodyLimit?: number; generator?: AnswerGenerator } & Partial<AppOptions> = {}) {
+  const { generator, ...appOptions } = options;
+  const { service, store } = createTestService(generator ? { generator } : {});
+  app = buildApp({ service, healthCheck: () => store.count(), ...appOptions });
   return { store };
 }
 
@@ -124,19 +125,25 @@ describe("POST /query", () => {
     expect(res.json().error.code).toBe("invalid_request");
   });
 
-  it("maps generator failures to 502 without leaking internals", async () => {
-    start({
+  it("maps upstream failures to 502 with a generic message and logs the detail", async () => {
+    const detail = "Upstream /chat/completions responded 503: connect ECONNREFUSED 10.0.3.7:8443 (internal-llm.corp.example)";
+    const lines: string[] = [];
+    const { service } = createTestService({
       generator: {
         name: "broken",
         generate: async () => {
-          throw new UpstreamError("Upstream /chat/completions responded 503");
+          throw new UpstreamError(detail, 503);
         },
       },
     });
+    app = buildApp({ service, logger: { level: "error", stream: { write: (line: string) => void lines.push(line) } } as never });
     await post("/documents", { id: "d", text: "Refunds take five days." });
     const res = await post("/query", { question: "refunds" });
+
     expect(res.statusCode).toBe(502);
-    expect(res.json().error).toEqual({ code: "upstream_error", message: "Upstream /chat/completions responded 503" });
+    expect(res.json().error).toEqual({ code: "upstream_error", message: expect.any(String) });
+    expect(res.body).not.toMatch(/10\.0\.3\.7|8443|internal-llm|ECONNREFUSED|503|chat\/completions/);
+    expect(lines.join("")).toContain("internal-llm.corp.example");
   });
 
   it("returns a JSON 404 for unknown routes", async () => {
@@ -144,5 +151,93 @@ describe("POST /query", () => {
     const res = await app.inject({ method: "GET", url: "/nope" });
     expect(res.statusCode).toBe(404);
     expect(res.json().error.code).toBe("not_found");
+  });
+});
+
+describe("API key authentication", () => {
+  const apiKey = "correct-horse-battery-staple";
+  const doc = { id: "d", text: "Refunds take five days." };
+  const call = (url: string, headers: Record<string, string> = {}, payload: object = doc) =>
+    app.inject({ method: "POST", url, headers, payload });
+
+  it("rejects requests without a key, with a wrong key, and with a wrong-length key", async () => {
+    start({ apiKey });
+    for (const url of ["/documents", "/query"]) {
+      const missing = await call(url, {}, { question: "q" });
+      expect(missing.statusCode).toBe(401);
+      expect(missing.json().error.code).toBe("unauthorized");
+      expect(missing.headers["www-authenticate"]).toContain("Bearer");
+      expect((await call(url, { authorization: "Bearer nope" })).statusCode).toBe(401);
+      expect((await call(url, { authorization: `Bearer ${apiKey}x` })).statusCode).toBe(401);
+      expect((await call(url, { authorization: `Bearer ${apiKey.slice(0, -1)}` })).statusCode).toBe(401);
+      expect((await call(url, { "x-api-key": "" })).statusCode).toBe(401);
+      expect((await call(url, { authorization: `Basic ${apiKey}` })).statusCode).toBe(401);
+    }
+  });
+
+  it("checks the key before parsing or validating the body", async () => {
+    start({ apiKey });
+    const res = await app.inject({ method: "POST", url: "/documents", headers: { "content-type": "application/json" }, payload: "{bad json" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("does not store anything for unauthenticated writes", async () => {
+    start({ apiKey });
+    await call("/documents");
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.json().chunks).toBe(0);
+  });
+
+  it("accepts the key as a bearer token or an X-API-Key header", async () => {
+    start({ apiKey });
+    expect((await call("/documents", { authorization: `Bearer ${apiKey}` })).statusCode).toBe(201);
+    expect((await call("/query", { "x-api-key": apiKey }, { question: "refunds" })).statusCode).toBe(200);
+    expect((await call("/query", { authorization: `bearer   ${apiKey}  ` }, { question: "refunds" })).statusCode).toBe(200);
+  });
+
+  it("leaves /health open", async () => {
+    start({ apiKey });
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+  });
+
+  it("does not require a key when none is configured", async () => {
+    start();
+    expect((await call("/documents")).statusCode).toBe(201);
+  });
+});
+
+describe("rate limiting", () => {
+  const query = () => app.inject({ method: "POST", url: "/query", payload: { question: "refunds" } });
+
+  it("returns 429 with Retry-After once the window budget is spent", async () => {
+    start({ rateLimit: { max: 3, windowMs: 60_000 } });
+    const statuses = [];
+    for (let i = 0; i < 5; i++) statuses.push((await query()).statusCode);
+    expect(statuses).toEqual([200, 200, 200, 429, 429]);
+
+    const limited = await query();
+    expect(limited.json().error.code).toBe("rate_limited");
+    expect(Number(limited.headers["retry-after"])).toBeGreaterThan(0);
+  });
+
+  it("applies to ingestion as well and leaves /health alone", async () => {
+    start({ rateLimit: { max: 1, windowMs: 60_000 } });
+    expect((await app.inject({ method: "POST", url: "/documents", payload: { text: "a note" } })).statusCode).toBe(201);
+    expect((await app.inject({ method: "POST", url: "/documents", payload: { text: "another note" } })).statusCode).toBe(429);
+    for (let i = 0; i < 5; i++) expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+  });
+
+  it("throttles wrong-key guesses before they reach authentication", async () => {
+    start({ apiKey: "correct-horse-battery-staple", rateLimit: { max: 2, windowMs: 60_000 } });
+    const guess = () => app.inject({ method: "POST", url: "/query", headers: { authorization: "Bearer wrong" }, payload: { question: "q" } });
+    expect([(await guess()).statusCode, (await guess()).statusCode, (await guess()).statusCode]).toEqual([401, 401, 429]);
+  });
+
+  it("is off when no limit is configured or the limit is 0", async () => {
+    start();
+    for (let i = 0; i < 5; i++) expect((await query()).statusCode).toBe(200);
+    await app.close();
+    start({ rateLimit: { max: 0, windowMs: 1000 } });
+    for (let i = 0; i < 5; i++) expect((await query()).statusCode).toBe(200);
   });
 });
