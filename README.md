@@ -14,6 +14,8 @@ npm run build
 PORT=3000 npm start          # or: npm run dev
 ```
 
+The server listens on `127.0.0.1` only. To expose it (for example in a container) you must also set `HOST` and `API_KEY`, see [Security](#security).
+
 Seed it with the sample handbook in `fixtures/corpus` (needs `jq`):
 
 ```bash
@@ -144,9 +146,11 @@ curl -s -X POST localhost:3000/query -H 'content-type: application/json' -d '{"q
 | situation                                    | status | `error.code`            |
 | -------------------------------------------- | ------ | ----------------------- |
 | schema violation, malformed JSON             | 400    | `invalid_request` / `bad_request` |
+| missing or wrong API key (when `API_KEY` is set) | 401 | `unauthorized`      |
 | body larger than `MAX_BODY_BYTES` (1 MiB)    | 413    | `payload_too_large`     |
 | non-JSON content type such as `application/xml` | 415 | `unsupported_media_type` |
-| embeddings / LLM endpoint failed             | 502    | `upstream_error`        |
+| more than `RATE_LIMIT_MAX` requests per window | 429  | `rate_limited` (with `Retry-After`) |
+| embeddings / LLM endpoint failed             | 502    | `upstream_error`, generic message; detail is only in the server log |
 
 ## Architecture
 
@@ -195,6 +199,7 @@ test/               vitest suites
 - The chunker splits markdown into paragraphs, never crosses a heading, and records each chunk's heading path (`Refund Policy > Processing time`). Fenced code blocks stay in one piece unless they exceed the size limit. Chunks are packed up to `CHUNK_MAX_TOKENS` (estimated as characters / 4); long paragraphs are split on sentences, then words; consecutive chunks in a section share up to `CHUNK_OVERLAP_TOKENS` of trailing text.
 - Chunk id = first 24 hex chars of a SHA-256 over document id, title, source, metadata, heading path, text and the number of identical chunks seen earlier in the document. Same input, same ids.
 - On ingest the service compares the new ids with the ids already stored for that document, embeds and upserts only the new ones, and deletes the ones that disappeared. Re-sending an unchanged document performs no embedding calls and no writes; editing one paragraph re-embeds only that chunk (its neighbours' `position` field is not refreshed).
+- Embedding happens outside any lock. The diff, upsert and delete then run under a per-document lock: on Postgres one transaction holding `pg_advisory_xact_lock(hashtext('rag_chunks:' || document_id))` (so concurrent ingests of the same document, even from different processes, run one after another and a failure rolls everything back); on the in-memory store an in-process mutex per document.
 - Changing title, source or metadata changes the ids, so those chunks are re-embedded and the old ones removed.
 
 ## Configuration
@@ -202,9 +207,13 @@ test/               vitest suites
 | variable                 | default                    | description                                                                                       |
 | ------------------------ | -------------------------- | ------------------------------------------------------------------------------------------------- |
 | `PORT`                   | `3000`                     | listen port                                                                                       |
-| `HOST`                   | `0.0.0.0`                  | listen address                                                                                    |
+| `HOST`                   | `127.0.0.1`                | listen address. Anything other than a loopback address requires `API_KEY`                         |
+| `API_KEY`                | unset                      | shared secret (16+ characters) required on every route except `/health`. **Required** when `HOST` is not loopback or when `EMBEDDINGS_API_KEY` / `LLM_API_KEY` is set; the server refuses to start otherwise |
+| `RATE_LIMIT_MAX`         | `120`                      | requests per client address per window on every route except `/health`; `0` disables              |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60`                    | length of the rate limit window                                                                   |
+| `TRUST_PROXY`            | `false`                    | `true` to take the client address from `X-Forwarded-For`; set it only behind a proxy you control, otherwise every client looks like the proxy (or can spoof its address) |
 | `LOG_LEVEL`              | `info`                     | `fatal` `error` `warn` `info` `debug` `trace` `silent`                                            |
-| `MAX_BODY_BYTES`         | `1048576`                  | request body limit; larger requests get 413                                                       |
+| `MAX_BODY_BYTES`         | `1048576`                  | request body limit; larger requests get 413. Values above 10 MiB are rejected at startup          |
 | `CHUNK_MAX_TOKENS`       | `200`                      | max estimated tokens per chunk                                                                    |
 | `CHUNK_OVERLAP_TOKENS`   | `30`                       | overlap between consecutive chunks (must be < max)                                                |
 | `MIN_SCORE`              | `0.05`                     | retrieved chunks with lower cosine similarity are discarded                                       |
@@ -224,6 +233,7 @@ Example, hosted embeddings and chat with Postgres:
 
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/rag
+export API_KEY=$(openssl rand -hex 32)      # required once provider keys are set
 export EMBEDDINGS_API_KEY=... EMBEDDINGS_DIMENSIONS=1536
 export LLM_API_KEY=...
 npm run migrate && npm start
@@ -234,13 +244,23 @@ When a generator is configured the model is told to answer only from the numbere
 ### Postgres + pgvector
 
 ```bash
-docker run -d --name rag-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rag pgvector/pgvector:pg16
+docker run -d --name rag-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rag pgvector/pgvector:0.8.6-pg16
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/rag
 npm run migrate        # creates the vector extension, rag_chunks table, indexes; safe to re-run
 npm start
 ```
 
 `npm run migrate` applies `migrations/*.sql` in order, records them in `rag_migrations`, and substitutes `EMBEDDINGS_DIMENSIONS` into `vector(N)`. The column size is fixed at migration time: if you change embedding models you need a new table or database. Search uses cosine distance (`<=>`) with an HNSW index (requires pgvector 0.5 or newer, and N <= 2000 for the index) and a GIN index for metadata filters (`metadata @> filter`).
+
+## Security
+
+- **Network exposure.** The server listens on `127.0.0.1` by default. To accept remote connections set `HOST` (for example `0.0.0.0` in a container) **and** `API_KEY`; without a key the process exits at startup with a message saying why. The same applies when `EMBEDDINGS_API_KEY` or `LLM_API_KEY` is set, because an open endpoint would let anyone spend it.
+- **Authentication.** With `API_KEY` set, send `Authorization: Bearer <key>` or `X-API-Key: <key>` on `POST /documents` and `POST /query`; `GET /health` stays open for probes. Comparison is constant-time (SHA-256 digests compared with `crypto.timingSafeEqual`, so key length is not leaked either), and the key is checked before the request body is read. It is a single shared secret. Terminate TLS in front of the server; keys travel in headers.
+- **Rate limiting.** `@fastify/rate-limit` runs before authentication so wrong-key guessing is throttled too: `RATE_LIMIT_MAX` requests per `RATE_LIMIT_WINDOW_SECONDS` per client address, then 429 with `Retry-After`. Behind a reverse proxy set `TRUST_PROXY=true`, otherwise all clients share the proxy's address.
+- **Limits.** Bodies are capped by `MAX_BODY_BYTES` (default 1 MiB, hard maximum 10 MiB); text, ids, metadata and `topK` have schema limits (see the API tables).
+- **Errors.** 502 responses carry a generic message; upstream hosts, ports and response bodies appear only in the server log. Request bodies are not logged.
+- **Prompt injection.** Anything you ingest becomes context for the generator, so ingested text is untrusted input. With an LLM generator, a document containing "ignore your instructions and ..." can try to steer the answer. The system prompt tells the model to treat passages as data and cite them, which reduces but does not eliminate the risk: only ingest content you trust, protect `POST /documents` with the API key, and read `citations` / `chunks` to see what an answer was based on. The default **extractive generator is not exposed to this**: it never sends text to a model, it only copies the highest-overlap sentence from each retrieved chunk and appends `[n]`, so instructions inside a document can at worst appear as quoted text. Document ids are caller-chosen, so a client with the key can overwrite any document by reusing its id.
+- Reporting and open dependency advisories: see [SECURITY.md](SECURITY.md).
 
 ## Tests
 
@@ -251,14 +271,14 @@ npm test
 
 `npm test` needs no network, API keys or database. It covers the chunker, embedder, both vector stores (one shared contract suite), the OpenAI-compatible adapters (fake `fetch`), extractive answers, citation format, retrieval ranking on the fixture corpus, idempotent and incremental re-ingest, zod validation, body size limits, error mapping, and config wiring.
 
-The pgvector integration tests (contract suite plus migrations) run only when `DATABASE_URL` is set and are reported as skipped otherwise. Without a database `npm test` reports `88 passed | 8 skipped`. With one:
+The pgvector integration tests (contract suite plus migrations) run only when `DATABASE_URL` is set and are reported as skipped otherwise. Without a database `npm test` reports `118 passed | 22 skipped`. With one:
 
 ```bash
-docker run -d --name rag-test-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rag_test pgvector/pgvector:pg16
+docker run -d --name rag-test-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rag_test pgvector/pgvector:0.8.6-pg16
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/rag_test npm test
 ```
 
-Each run creates and drops its own schema. CI starts a `pgvector/pgvector:pg16` service and runs everything.
+With a database the full suite reports `139 passed | 1 skipped` (the one skip is a rollback test that only applies to transactional stores). Each run creates and drops its own schema. CI starts a `pgvector/pgvector:0.8.6-pg16` service (pinned by digest) and runs everything.
 
 ## Evaluation
 
@@ -296,7 +316,7 @@ hit@k is the share of questions with a relevant chunk in the top k; MRR@10 is th
 - **The default embedder is a toy.** `HashingEmbedder` is a bag of stemmed words and word pairs hashed into a fixed-size vector. It matches vocabulary, not meaning: "money back" will not find "refund", and "daily meal allowance" only ranks the "Meals are limited to 60 dollars" chunk 10th in the eval above. Hash collisions also give unrelated text a small non-zero similarity (the nonsense query "zyzzyva quokka xylophone" scores 0.15 against some chunk of the sample corpus), so `MIN_SCORE` is a weak "no answer" filter in demo mode. It exists so the pipeline is testable and demoable offline; use a real embedding model (`EMBEDDINGS_BASE_URL`) for anything that needs semantic search.
 - **Extractive answers are quotes, not synthesis.** The default generator picks the sentence overlapping the question most from each of the best chunks. It cannot combine facts, resolve pronouns or say "no" to a yes/no question.
 - **The in-memory store is not persistent** and does brute-force search; use `DATABASE_URL` for anything beyond demos or a few thousand chunks.
-- **No authentication, rate limiting or multi-tenancy.** Put it behind a gateway; `filter` is a convenience, not an access control boundary.
+- **One shared API key, no multi-tenancy.** There are no users, roles or per-collection permissions; `filter` is a convenience, not an access control boundary. Rate limiting is in memory and per process, so it is per instance, not global.
 - No document deletion or listing endpoints, no hybrid (keyword + vector) search, no reranking, no streaming responses.
 - The token count is a characters / 4 estimate, not a real tokenizer, so chunk sizes are approximate for non-English text and code.
 - The pgvector column dimension is fixed when the migration runs.
