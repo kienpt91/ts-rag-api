@@ -85,7 +85,9 @@ export class RagService {
    * Chunk ids are a SHA-256 over document id, title, source, metadata, heading, text and the number of
    * earlier identical chunks in the same document. Re-ingesting the same input therefore yields the same
    * ids, embeds nothing and writes nothing. Editing a document embeds only the chunks whose ids are new
-   * and deletes the ids that disappeared.
+   * and deletes the ids that disappeared. The diff, upsert and delete run under the store's per-document
+   * lock (a transaction with an advisory lock on Postgres), so concurrent ingests of one document cannot
+   * leave a mix of both versions behind.
    */
   async ingest(input: IngestInput): Promise<IngestResult> {
     const documentId = input.id ?? sha256Hex(input.text).slice(0, 16);
@@ -102,36 +104,51 @@ export class RagService {
       return { ...chunk, id: sha256Hex(base, String(occurrence)).slice(0, 24) };
     });
 
-    const existing = new Set(await this.options.store.chunkIds(documentId));
-    const fresh = planned.filter((c) => !existing.has(c.id));
-    const keep = new Set(planned.map((c) => c.id));
-    const stale = [...existing].filter((id) => !keep.has(id));
+    // Embedding is slow and may call a paid API, so it happens outside the store lock. A first look at
+    // the stored ids decides what to embed; the authoritative diff is repeated under the lock below.
+    const vectors = new Map<string, number[]>();
+    const embedMissing = async (known: Set<string>) => {
+      const todo = planned.filter((c) => !known.has(c.id) && !vectors.has(c.id));
+      if (todo.length === 0) return;
+      const embedded = await this.options.embedder.embed(todo.map((c) => embeddingText(c.heading, c.text)));
+      todo.forEach((c, i) => vectors.set(c.id, embedded[i]!));
+    };
+    await embedMissing(new Set(await this.options.store.chunkIds(documentId)));
 
-    if (fresh.length > 0) {
-      const vectors = await this.options.embedder.embed(fresh.map((c) => embeddingText(c.heading, c.text)));
-      const records: StoredChunk[] = fresh.map((chunk, i) => ({
-        id: chunk.id,
-        documentId,
-        title,
-        source,
-        heading: chunk.heading,
-        position: chunk.position,
-        text: chunk.text,
-        metadata,
-        embedding: vectors[i]!,
-      }));
-      await this.options.store.upsert(records);
-    }
-    // Positions of retained chunks may have shifted; they are cosmetic and refreshed only for new chunks.
-    await this.options.store.delete(stale);
+    const keep = new Set(planned.map((c) => c.id));
+    const { added, removed } = await this.options.store.withDocumentLock(documentId, async (store) => {
+      const existing = new Set(await store.chunkIds(documentId));
+      const fresh = planned.filter((c) => !existing.has(c.id));
+      const stale = [...existing].filter((id) => !keep.has(id));
+      // Only reached when another writer removed chunks between the first look and taking the lock.
+      await embedMissing(existing);
+      if (fresh.length > 0) {
+        await store.upsert(
+          fresh.map((chunk) => ({
+            id: chunk.id,
+            documentId,
+            title,
+            source,
+            heading: chunk.heading,
+            position: chunk.position,
+            text: chunk.text,
+            metadata,
+            embedding: vectors.get(chunk.id)!,
+          })),
+        );
+      }
+      // Positions of retained chunks may have shifted; they are cosmetic and refreshed only for new chunks.
+      await store.delete(stale);
+      return { added: fresh.length, removed: stale.length };
+    });
 
     return {
       documentId,
       title,
       chunks: planned.length,
-      added: fresh.length,
-      removed: stale.length,
-      unchanged: fresh.length === 0 && stale.length === 0,
+      added,
+      removed,
+      unchanged: added === 0 && removed === 0,
     };
   }
 

@@ -19,7 +19,16 @@ export function chunk(id: string, embedding: number[], extra: Partial<StoredChun
 }
 
 /** Behaviour every VectorStore implementation must share. `create` must return an empty store. */
-export function describeVectorStore(label: string, create: () => Promise<VectorStore>, options: { skip?: boolean } = {}) {
+export function describeVectorStore(
+  label: string,
+  create: () => Promise<VectorStore>,
+  options: {
+    skip?: boolean;
+    transactional?: boolean;
+    /** False for stores that share one connection and therefore serialise all documents. Default true. */
+    parallelDocuments?: boolean;
+  } = {},
+) {
   describe.skipIf(options.skip)(`VectorStore contract: ${label}`, () => {
     let store: VectorStore;
     beforeEach(async () => {
@@ -86,6 +95,41 @@ export function describeVectorStore(label: string, create: () => Promise<VectorS
       expect(await store.chunkIds("a")).toEqual(["a2"]);
       expect(await store.count()).toBe(2);
       expect(await store.chunkIds("missing")).toEqual([]);
+    });
+
+    it("withDocumentLock runs same-document callbacks one at a time and different documents concurrently", async () => {
+      const log: string[] = [];
+      const hold = (name: string, documentId: string, ms: number) =>
+        store.withDocumentLock(documentId, async () => {
+          log.push(`start ${name}`);
+          await new Promise((r) => setTimeout(r, ms));
+          log.push(`end ${name}`);
+        });
+      await Promise.all([hold("a1", "a", 40), hold("a2", "a", 5), hold("b", "b", 5)]);
+      expect(log.indexOf("end a1")).toBeLessThan(log.indexOf("start a2"));
+      if (options.parallelDocuments !== false) expect(log.indexOf("start b")).toBeLessThan(log.indexOf("end a1"));
+    });
+
+    it("withDocumentLock returns the callback result and keeps serving after a callback throws", async () => {
+      await expect(store.withDocumentLock("a", async () => 42)).resolves.toBe(42);
+      await expect(
+        store.withDocumentLock("a", async () => {
+          throw new Error("boom");
+        }),
+      ).rejects.toThrow("boom");
+      await expect(store.withDocumentLock("a", async (s) => s.count())).resolves.toBe(0);
+    });
+
+    it.skipIf(!options.transactional)("withDocumentLock rolls back every write when the callback throws", async () => {
+      await store.upsert([chunk("keep", [1, 0, 0, 0], { documentId: "a" })]);
+      await expect(
+        store.withDocumentLock("a", async (tx) => {
+          await tx.upsert([chunk("new", [0, 1, 0, 0], { documentId: "a" })]);
+          await tx.delete(["keep"]);
+          throw new Error("fail midway");
+        }),
+      ).rejects.toThrow("fail midway");
+      expect(await store.chunkIds("a")).toEqual(["keep"]);
     });
 
     it("returns nothing from an empty store", async () => {

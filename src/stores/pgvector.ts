@@ -1,11 +1,17 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { KeyedMutex } from "../mutex.js";
 import type { Metadata, ScoredChunk, SearchOptions, StoredChunk, VectorStore } from "../types.js";
 
 /** The subset of `pg.Pool` / `pg.Client` used here, so tests can substitute a recording fake. */
 export interface Queryable {
   query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+}
+
+/** A `pg.Pool`-like handle that can lend out dedicated connections for transactions. */
+export interface PoolLike extends Queryable {
+  connect(): Promise<Queryable & { release(error?: Error | boolean): void }>;
 }
 
 const INSERT_BATCH = 100;
@@ -46,7 +52,48 @@ export async function migrate(db: Queryable, options: { dimensions: number; dir?
 export class PgVectorStore implements VectorStore {
   readonly name = "pgvector";
 
-  constructor(private readonly db: Queryable) {}
+  private readonly locks = new KeyedMutex();
+
+  /**
+   * `db` may be a `pg.Pool` or a single `pg.Client`. Pass the pool as `options.pool` as well to let
+   * `withDocumentLock` take a dedicated connection per transaction; without it, transactions run on `db`
+   * itself and are serialised in-process so that they cannot interleave on one connection.
+   */
+  constructor(
+    private readonly db: Queryable,
+    private readonly options: { pool?: PoolLike } = {},
+  ) {}
+
+  /**
+   * Runs `fn` in one transaction holding a per-document advisory lock (`pg_advisory_xact_lock`), so
+   * concurrent ingests of the same document, from any process, are serialised and commit or roll back
+   * as a unit. The lock is released automatically at COMMIT/ROLLBACK.
+   */
+  async withDocumentLock<T>(documentId: string, fn: (store: VectorStore) => Promise<T>): Promise<T> {
+    const pool = this.options.pool;
+    const client = pool ? await pool.connect() : undefined;
+    const conn: Queryable = client ?? this.db;
+    let broken = false;
+    const run = async () => {
+      await conn.query("BEGIN");
+      try {
+        await conn.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`rag_chunks:${documentId}`]);
+        const result = await fn(new PgVectorStore(conn));
+        await conn.query("COMMIT");
+        return result;
+      } catch (error) {
+        await conn.query("ROLLBACK").catch(() => {
+          broken = true;
+        });
+        throw error;
+      }
+    };
+    try {
+      return client ? await run() : await this.locks.run("*", run);
+    } finally {
+      client?.release(broken);
+    }
+  }
 
   async upsert(chunks: StoredChunk[]): Promise<void> {
     for (let start = 0; start < chunks.length; start += INSERT_BATCH) {

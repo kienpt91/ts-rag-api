@@ -1,3 +1,4 @@
+import { KeyedMutex } from "../mutex.js";
 import type { Metadata, ScoredChunk, SearchOptions, StoredChunk, VectorStore } from "../types.js";
 
 export function cosine(a: number[], b: number[]): number {
@@ -23,6 +24,7 @@ function matches(metadata: Metadata, filter: Metadata | undefined): boolean {
 export class InMemoryVectorStore implements VectorStore {
   readonly name = "memory";
   private readonly chunks = new Map<string, StoredChunk>();
+  private readonly locks = new KeyedMutex();
 
   async upsert(chunks: StoredChunk[]): Promise<void> {
     for (const chunk of chunks) this.chunks.set(chunk.id, { ...chunk, metadata: { ...chunk.metadata } });
@@ -49,5 +51,10 @@ export class InMemoryVectorStore implements VectorStore {
 
   async count(): Promise<number> {
     return this.chunks.size;
+  }
+
+  /** In-process only, and not transactional: writes made before `fn` throws are kept. */
+  withDocumentLock<T>(documentId: string, fn: (store: VectorStore) => Promise<T>): Promise<T> {
+    return this.locks.run(documentId, () => fn(this));
   }
 }

@@ -48,6 +48,12 @@ export interface VectorStore {
   /** Top-k chunks by cosine similarity, best first. */
   search(embedding: number[], k: number, options?: SearchOptions): Promise<ScoredChunk[]>;
   count(): Promise<number>;
+  /**
+   * Runs `fn` with exclusive access to one document's chunks: concurrent calls for the same document id
+   * run one after another (across processes, where the store is shared). `fn` must use the store it is
+   * handed, which is transactional where the backend supports it: if `fn` throws, its writes are rolled back.
+   */
+  withDocumentLock<T>(documentId: string, fn: (store: VectorStore) => Promise<T>): Promise<T>;
 }
 
 export interface GenerateInput {
