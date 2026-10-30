@@ -18,7 +18,7 @@ export interface StoredChunk {
   source: string | null;
   /** Heading path such as "Refund Policy > Eligibility"; empty for text before the first heading. */
   heading: string;
-  /** Zero-based position of the chunk within its document. */
+  /** Zero-based position within the document when the chunk was written; not refreshed if only neighbours change. */
   position: number;
   text: string;
   metadata: Metadata;
